@@ -1,0 +1,70 @@
+name: Testar pkcs11 no macOS
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'pkcs11/**'
+      - '.github/workflows/test-pkcs11-macos.yml'
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compilar o módulo pkcs11 (.dylib)
+        run: |
+          cd pkcs11
+          cargo build --release
+
+      - name: Configurar Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Subir o broker falso em segundo plano
+        run: |
+          # Troca este arquivo pelo der_b64 real do seu certificado antes de
+          # rodar (o mesmo texto que você já colou no MyCert no Windows), ou
+          # cola direto aqui via um Secret do repositório se preferir não
+          # deixar no código.
+          echo "${{ secrets.TEST_CERT_DER_B64 }}" > /tmp/der_b64.txt
+          nohup python3 pkcs11/test/mock_broker.py /tmp/der_b64.txt 47891 \
+            > /tmp/mock_broker.log 2>&1 &
+          sleep 1
+          curl -sf http://127.0.0.1:47891/v1/health
+
+      - name: Gerar o .cfg do SunPKCS11 apontando pro .dylib compilado
+        run: |
+          DYLIB_PATH="$(pwd)/pkcs11/target/release/libmycert_pkcs11.dylib"
+          cat > /tmp/mycert-sunpkcs11.cfg <<EOF
+          name = MyCertMock
+          library = ${DYLIB_PATH}
+          slotListIndex = 0
+          showInfo = false
+          EOF
+          cat /tmp/mycert-sunpkcs11.cfg
+
+      - name: Listar o certificado via keytool (teste real de ponta a ponta)
+        env:
+          MYCERT_BROKER_URL: http://127.0.0.1:47891
+        run: |
+          keytool -list -storetype PKCS11 \
+            -providerclass sun.security.pkcs11.SunPKCS11 \
+            -providerarg /tmp/mycert-sunpkcs11.cfg \
+            -storepass "" -v | tee /tmp/keytool-output.txt
+          grep -q "MyCert QA" /tmp/keytool-output.txt
+
+      - name: Publicar o .dylib e os logs como artefato
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mycert-pkcs11-mac
+          path: |
+            pkcs11/target/release/*.dylib
+            /tmp/mock_broker.log
+            /tmp/keytool-output.txt

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none';">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MyCert | Integração PKCS#11</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">M</div>
+    <div>
+      <p class="eyebrow">MYCERT DESKTOP</p>
+      <h1>Integração PKCS#11</h1>
+    </div>
+    <span class="status-pill" id="header-status">Broker iniciando</span>
+  </header>
+
+  <main class="layout">
+    <section class="hero card">
+      <div>
+        <p class="eyebrow">PJe Office e aplicativos compatíveis</p>
+        <h2>Seu certificado remoto, disponível como token local.</h2>
+        <p class="muted">Autorize o certificado uma vez nesta aplicação. O módulo PKCS#11 ficará disponível para os aplicativos compatíveis, enquanto a chave privada permanece no serviço remoto.</p>
+      </div>
+      <div class="hero-badge"><span>01</span><small>Windows<br />macOS</small></div>
+    </section>
+
+    <div class="columns">
+      <section class="card">
+        <div class="section-heading"><span class="step">01</span><div><h3>Conexão com a API</h3><p>URLs e credenciais da integração.</p></div></div>
+        <form id="config-form">
+          <label>API de assinatura (base OAuth)<input id="apiBaseUrl" type="url" required /></label>
+          <label>API OAuth / autorização<input id="oauthBaseUrl" type="url" required /></label>
+          <label>API da demonstração / callback<input id="demoApiBaseUrl" type="url" required /></label>
+          <label>Redirect URI / Webhook cadastrado<input id="redirectUri" type="url" placeholder="Deixe vazio para montar a partir do servidor de callback abaixo" /></label>
+          <p class="hint">Informe exatamente a URI cadastrada na aplicação Safeweb. Se ficar vazio, o app monta a URI a partir do "Servidor de callback do MyCert" logo abaixo — <strong>não usa mais a demonstração pública</strong> (ver DIAGNOSTICO-CALLBACK-SAFEID.md).</p>
+          <div class="two-col">
+            <label>Servidor de callback do MyCert<input id="callbackServerUrl" type="url" placeholder="https://callback.seudominio.com.br" /></label>
+            <label>Token do callback<input id="callbackToken" type="password" placeholder="mesmo CALLBACK_TOKEN do servidor" /></label>
+          </div>
+          <p class="hint">Base pública e token do <code>mycert-callback-server</code> (pasta <code>callback-server/</code> deste projeto). Precisam ser exatamente os mesmos valores usados para subir aquele servidor, e a URI resultante (<code>{servidor}/ca/callback/{token}</code>) precisa estar cadastrada no SafeWeb para este client_id antes de funcionar.</p>
+          <div class="two-col"><label>Client ID<input id="clientId" type="text" /></label><label>Client Secret <span class="label-help">(backend local/privado)</span><input id="clientSecret" type="password" /></label></div>
+          <p class="hint">Na demonstração Safeweb, o backend troca o identifierCA por JWT. O Client Secret fica no backend da demonstração; não publique nem compartilhe esse valor.</p>
+          <div class="two-col"><label>Documento<input id="document" type="text" placeholder="CPF/CNPJ" /></label><label>Usuário<input id="username" type="text" /></label></div>
+          <label>Senha/PIN do certificado digital<input id="certificatePin" type="password" placeholder="senha do titular no token/certificado" /></label>
+          <p class="hint">Necessária na troca do identifierCA por token de sessão: o SafeWeb exige a concatenação de dois fatores (identifierCA + esta senha) no serviço "Autorização com credenciais do titular". Sem ela, a troca é recusada com "segundo fator de autenticação" faltando.</p>
+          <label>Lifetime do token, em segundos<input id="lifetime" type="number" min="60" step="60" /></label>
+          <div class="actions"><button class="primary" type="submit">Salvar configuração</button><button class="quiet" id="reset-config" type="button">Restaurar padrão</button></div>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="section-heading"><span class="step">02</span><div><h3>Autorizar certificado</h3><p>Fluxo push da demonstração recebida.</p></div></div>
+        <form id="authorization-form">
+          <label>Documento a autorizar<input id="authorization-document" type="text" placeholder="CPF/CNPJ" required /></label>
+          <button class="primary full" type="submit">Iniciar autorização CA</button>
+        </form>
+        <div class="progress-box" id="authorization-box"><span class="dot"></span><div><strong id="authorization-title">Aguardando autorização</strong><p id="authorization-message">O aplicativo fará o polling do callback até receber o identifierCA.</p></div></div>
+        <details class="diagnostic-details"><summary>Resposta técnica da última autorização</summary><pre class="diagnostics" id="authorization-response">Nenhuma autorização iniciada.</pre></details>
+        <div class="data-grid"><div><small>identifierCA</small><strong id="identifierCA-display">Não autorizado</strong></div><div><small>serialNumber</small><strong id="serial-display">—</strong></div></div>
+        <button class="quiet full" id="save-identifier" type="button" disabled>Salvar autorização neste dispositivo</button>
+      </section>
+    </div>
+
+    <div class="columns">
+      <section class="card">
+        <div class="section-heading"><span class="step">03</span><div><h3>Certificado e token</h3><p>Dados públicos usados pelo módulo nativo.</p></div></div>
+        <div class="two-col"><label>Alias do certificado<input id="certificateAlias" type="text" placeholder="Ex.: e-CPF principal" /></label><label>ID do certificado<input id="certificateId" type="text" /></label></div>
+        <label>Caminho da biblioteca PKCS#11<input id="modulePath" type="text" placeholder="Será preenchido ao instalar a configuração" /></label>
+                  <label>Certificados em JSON <span class="label-help">(manual; use DER em Base64)</span><textarea id="certificates" rows="7" spellcheck="false" placeholder='[{"id":"cert-1","alias":"Meu certificado","der_b64":"...","public_key_der_b64":"...","algorithm":"RSA"}]'></textarea></label>
+        <p class="hint">A demonstração 2 não possui uma rota de listagem de certificados. Informe aqui os dados públicos fornecidos pela API/PSC em DER convertido para Base64. A chave privada nunca é armazenada.</p>
+        <button class="primary full" id="save-certificate" type="button">Salvar certificado e metadados</button>
+      </section>
+
+      <section class="card">
+        <div class="section-heading"><span class="step">04</span><div><h3>Instalação PKCS#11</h3><p>Gere a configuração compatível com SunPKCS11.</p></div></div>
+        <div class="install-panel"><div class="module-icon">PK</div><div><strong>MyCert SunPKCS11</strong><p id="module-status">Biblioteca ainda não configurada.</p></div></div>
+        <button class="primary full" id="install-config" type="button">Gerar arquivo de configuração</button>
+        <button class="quiet full" id="run-diagnostics" type="button">Executar diagnóstico</button>
+        <pre class="diagnostics" id="diagnostics">Nenhum diagnóstico executado.</pre>
+      </section>
+    </div>
+
+    <section class="card next-steps"><div><p class="eyebrow">Próximo passo</p><h3>Configure o aplicativo consumidor</h3><p class="muted">No PJe Office ou no aplicativo Java compatível, selecione PKCS#11 e informe o arquivo `.cfg` gerado. O módulo expõe um slot único e encaminha a assinatura para o MyCert.</p></div><div class="next-number">05</div></section>
+  </main>
+  <footer>MyCert Desktop · A chave privada não deixa o serviço de assinatura.</footer>
+  <script src="./renderer.js"></script>
+</body>
+</html>

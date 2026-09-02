@@ -1,0 +1,46 @@
+{
+  "name": "mycert-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aplicativo desktop de configuração do MyCert PKCS#11",
+  "main": "dist/main.js",
+  "author": "MyCert",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "dev": "npm run build && electron .",
+    "dist": "npm run build && electron-builder --win --mac"
+  },
+  "dependencies": {
+    "electron": "^39.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.7.3"
+  },
+  "build": {
+    "appId": "br.com.mycert.desktop",
+    "productName": "MyCert",
+    "files": ["dist/**/*", "renderer/**/*"],
+    "extraResources": [{
+      "from": "../pkcs11/target/release",
+      "to": "native",
+      "filter": ["mycert_pkcs11.dll", "libmycert_pkcs11.dylib", "libmycert_pkcs11.so"]
+    }],
+    "mac": {
+      "target": ["dmg", "zip"],
+      "hardenedRuntime": true,
+      "category": "public.app-category.business"
+    },
+    "win": {
+      "target": ["nsis", "zip"],
+      "publisherName": "MyCert"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

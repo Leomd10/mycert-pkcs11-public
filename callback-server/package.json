@@ -1,0 +1,17 @@
+{
+  "name": "mycert-callback-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Recebe o callback (POST) de autorização CA do SafeID/PSC e expõe o resultado para o app desktop MyCert consultar",
+  "main": "dist/server.js",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "npm run build && node dist/server.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.3"
+  }
+}

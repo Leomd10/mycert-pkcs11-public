@@ -1,0 +1,19 @@
+# Build / dependências
+node_modules/
+target/
+desktop/dist/
+callback-server/data/
+
+# Config local sensível (nunca deve ser versionada)
+*.enc
+.env
+.env.*
+
+# Logs de diagnóstico (podem ter dados de teste)
+*.log
+mycert_pkcs11.log
+
+# Editor / SO
+.vscode/
+.DS_Store
+Thumbs.db

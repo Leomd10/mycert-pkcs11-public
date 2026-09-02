@@ -1,0 +1,35 @@
+[package]
+name = "mycert-pkcs11"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "PKCS#11 bridge for MyCert desktop integration"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+native-pkcs11 = { path = "vendor/native-pkcs11", features = ["custom-function-list"] }
+native-pkcs11-traits = "0.2.27"
+pkcs11-sys = "0.2.25"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+sha1 = "0.10"
+sha2 = "0.10"
+# Só usada para extrair modulus/expoente público da chave pública (SubjectPublicKeyInfo
+# em DER) e devolver via CKA_MODULUS/CKA_PUBLIC_EXPONENT — o SunPKCS11 do Java exige
+# esses dois atributos na própria chave privada pra montar o objeto de chave (P11Key),
+# mesmo eles sendo dado público. Ver comentário em cima de mycert_C_GetAttributeValue.
+rsa = { version = "0.9", default-features = false, features = ["std", "pkcs5"] }
+# Usada só para ler a chave pública de dentro do certificado X.509 (der_b64) e extrair
+# modulus/expoente — o JSON do MyCert normalmente não traz public_key_der_b64 separado.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
