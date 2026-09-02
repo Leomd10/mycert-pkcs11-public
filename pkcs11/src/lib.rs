@@ -818,3 +818,40 @@ unsafe extern "C" fn mycert_C_Logout(_hSession: CK_SESSION_HANDLE) -> CK_RV {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // DigestInfo real de MD5 (34 bytes) — o mesmo prefixo que o PJeOffice envia via
+    // MD5withRSA (ver DIAGNOSTICO-CALLBACK-SAFEID.md). Os últimos 16 bytes são só um
+    // hash de exemplo, não precisam corresponder a nada real pra este teste.
+    const MD5_DIGEST_INFO: [u8; 34] = [
+        0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05,
+        0x00, 0x04, 0x10, 0x88, 0x71, 0xD7, 0xB7, 0x6B, 0x54, 0xDC, 0x5D, 0x09, 0xFD, 0xD1, 0x71,
+        0x7D, 0x1C, 0x75, 0xF3,
+    ];
+
+    #[test]
+    fn reconhece_oid_do_md5_no_digest_info() {
+        assert_eq!(digest_info_oid(&MD5_DIGEST_INFO), Some("1.2.840.113549.2.5".to_string()));
+    }
+
+    #[test]
+    fn separa_o_hash_puro_do_cabecalho_md5() {
+        let (hash, oid) = split_digest_info(&MD5_DIGEST_INFO).expect("deveria reconhecer o MD5");
+        assert_eq!(oid, "1.2.840.113549.2.5");
+        // Só os 16 bytes do hash, sem o cabeçalho ASN.1 — é essa separação que corrige o
+        // "O OID do hash é inválido" que a API da SafeWeb devolvia quando mandávamos o
+        // DigestInfo inteiro como se fosse só o hash.
+        assert_eq!(hash.len(), 16);
+        assert_eq!(hash, &MD5_DIGEST_INFO[18..]);
+    }
+
+    #[test]
+    fn dados_sem_prefixo_conhecido_nao_reconhece_oid() {
+        let dados_aleatorios = [0xAA_u8; 32];
+        assert_eq!(digest_info_oid(&dados_aleatorios), None);
+        assert_eq!(split_digest_info(&dados_aleatorios), None);
+    }
+}

@@ -20,6 +20,11 @@ jobs:
           cd pkcs11
           cargo build --release
 
+      - name: Rodar os testes unitários (parsing do DigestInfo, etc.)
+        run: |
+          cd pkcs11
+          cargo test --release
+
       - name: Configurar Java
         uses: actions/setup-java@v4
         with:

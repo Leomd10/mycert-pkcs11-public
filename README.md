@@ -27,6 +27,13 @@ assinatura para a API do provedor via um serviço local.
 Validado de ponta a ponta com um assinador real (SERPRO), usando SHA-256 e
 assinatura RAW.
 
+<!--
+  Print da tela de configuração/autorização do MyCert Desktop.
+  Basta arrastar a imagem pra essa pasta (ex.: docs/screenshot.png) e trocar
+  o caminho abaixo — o comentário HTML acima não aparece renderizado.
+-->
+![Tela do MyCert Desktop](docs/screenshot.png)
+
 ## Requisitos
 
 - **App desktop:** Node.js 22+ e npm.
@@ -60,8 +67,9 @@ Gera `target/release/mycert_pkcs11.dll` (Windows), `libmycert_pkcs11.dylib`
 
 Para testar a biblioteca fora de um assinador de verdade, veja
 `pkcs11/test/mock_broker.py` e o workflow em
-`.github/workflows/test-pkcs11-macos.yml` (roda e testa o módulo num runner
-macOS real, sem precisar de hardware Apple).
+`.github/workflows/test-pkcs11-macos.yml` (compila, roda os testes unitários
+do módulo e testa a `.dylib` com `keytool` num runner macOS real, sem
+precisar de hardware Apple).
 
 ## Servidor de callback
 
