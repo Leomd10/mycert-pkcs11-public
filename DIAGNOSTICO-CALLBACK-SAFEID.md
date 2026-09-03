@@ -1,3 +1,8 @@
+> **✅ RESOLVIDO.** Este documento registra a investigação original do
+> problema de callback. A causa raiz e a correção estão descritas nas
+> seções abaixo; o fluxo funciona desde então. Mantido como registro
+> histórico do processo de diagnóstico.
+
 # Diagnóstico — callback de autorização CA do SafeID/PSC não chega ao MyCert
 
 > Leia este arquivo antes de mexer em qualquer coisa. Ele resume tudo que já foi
