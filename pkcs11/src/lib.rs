@@ -88,6 +88,11 @@ struct CertificateWire {
     der_b64: String,
     #[serde(default)]
     public_key_der_b64: String,
+    /// Certificados intermediários da cadeia (AC emissora e ACs acima dela), em DER
+    /// base64. Sem eles o consumidor reporta "Cadeia de Certificados: AUSENTE" — o
+    /// certificado do titular sozinho não permite validar a corrente até a raiz.
+    #[serde(default)]
+    chain_der_b64: Vec<String>,
     #[serde(default = "default_algorithm")]
     algorithm: String,
 }
@@ -154,7 +159,7 @@ impl BackendState {
     fn login(&self, pin: Option<&str>) -> BackendResult<()> {
         let response: BrokerLoginResponse = ureq::post(&self.url("session/login"))
             .send_json(serde_json::json!({ "pin": pin }))
-            .map_err(|error| boxed(format!("broker login failed: {error}")))?
+            .map_err(|error| erro_do_broker("broker login failed", error))?
             .into_json()
             .map_err(|error| boxed(format!("invalid broker login response: {error}")))?;
         *self.session_token.write().map_err(|_| boxed("session lock poisoned"))? =
@@ -196,7 +201,7 @@ impl BackendState {
     fn certificates(&self) -> BackendResult<Vec<CertificateWire>> {
         let response: CertificatesResponse = ureq::get(&self.url("certificates"))
             .call()
-            .map_err(|error| boxed(format!("certificate discovery failed: {error}")))?
+            .map_err(|error| erro_do_broker("certificate discovery failed", error))?
             .into_json()
             .map_err(|error| boxed(format!("invalid certificate response: {error}")))?;
         Ok(response.certificates)
@@ -210,11 +215,22 @@ struct MyCertBackend {
 
 impl MyCertBackend {
     fn certificate_objects(&self) -> BackendResult<Vec<Box<dyn Certificate>>> {
-        self.state
-            .certificates()?
-            .into_iter()
-            .map(|wire| build_certificate(wire, Arc::clone(&self.state)))
-            .collect()
+        let mut objetos: Vec<Box<dyn Certificate>> = Vec::new();
+        for wire in self.state.certificates()? {
+            // Cada certificado da cadeia também vira um objeto PKCS#11 próprio, para
+            // que o consumidor (Java/PJe) consiga montar a corrente de confiança até a
+            // raiz ICP-Brasil. Sem isso o teste do PJeOffice reporta a cadeia ausente.
+            for (indice, chain_b64) in wire.chain_der_b64.iter().enumerate() {
+                match build_chain_certificate(&wire.id, indice, chain_b64, Arc::clone(&self.state)) {
+                    Ok(certificado) => objetos.push(certificado),
+                    // Um elo inválido não pode derrubar a listagem inteira: o certificado
+                    // do titular ainda é utilizável, só a validação da cadeia fica incompleta.
+                    Err(erro) => debug_log(&format!("  -> cadeia: elo {indice} ignorado ({erro})")),
+                }
+            }
+            objetos.push(build_certificate(wire, Arc::clone(&self.state))?);
+        }
+        Ok(objetos)
     }
 }
 
@@ -341,6 +357,38 @@ fn build_certificate(wire: CertificateWire, state: Arc<BackendState>) -> Backend
     Ok(Box::new(RemoteCertificate { id, label, der, public_key, _state: state }))
 }
 
+/// Monta um objeto PKCS#11 para um certificado intermediário da cadeia. A chave pública
+/// é extraída do próprio certificado (SubjectPublicKeyInfo), já que a cadeia não traz
+/// esse dado separado — e o rótulo sai do CN do emissor, para ficar reconhecível na
+/// listagem do consumidor.
+fn build_chain_certificate(
+    id_base: &str,
+    indice: usize,
+    chain_b64: &str,
+    state: Arc<BackendState>,
+) -> BackendResult<Box<dyn Certificate>> {
+    let der = STANDARD
+        .decode(chain_b64.trim())
+        .map_err(|error| boxed(format!("invalid chain certificate DER: {error}")))?;
+    let certificado = x509_cert::Certificate::from_der(&der)
+        .map_err(|error| boxed(format!("invalid chain certificate: {error}")))?;
+    let spki_der = certificado
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|error| boxed(format!("invalid chain SubjectPublicKeyInfo: {error}")))?;
+
+    let id = format!("{id_base}-ca{indice}").into_bytes();
+    let label = certificado.tbs_certificate.subject.to_string();
+    let public_key = RemotePublicKey {
+        id: id.clone(),
+        label: label.clone(),
+        der: spki_der,
+        algorithm: KeyAlgorithm::Rsa,
+    };
+    Ok(Box::new(RemoteCertificate { id, label, der, public_key, _state: state }))
+}
+
 fn non_empty(first: &str, second: &str, fallback: &str) -> String {
     if !first.is_empty() {
         first.to_string()
@@ -444,7 +492,7 @@ impl PrivateKey for RemotePrivateKey {
             algorithm,
             data.len()
         ));
-        let token = match self.state.token_or_login() {
+        let mut token = match self.state.token_or_login() {
             Ok(token) => token,
             Err(error) => {
                 debug_log(&format!("  -> falhou ao obter token de sessao: {error}"));
@@ -469,19 +517,50 @@ impl PrivateKey for RemotePrivateKey {
                 signature_format,
             }],
         };
-        let http = ureq::post(&self.state.url("sign"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(serde_json::to_value(request).map_err(|error| boxed(error.to_string()))?);
-        let http = match http {
-            Ok(response) => response,
-            Err(ureq::Error::Status(code, response)) => {
-                let corpo = response.into_string().unwrap_or_default();
-                debug_log(&format!("  -> servidor recusou a assinatura: HTTP {code} corpo={corpo}"));
-                return Err(boxed(format!("remote signature failed: HTTP {code}: {corpo}")));
-            }
-            Err(error) => {
-                debug_log(&format!("  -> falha de rede ao assinar: {error}"));
-                return Err(boxed(format!("remote signature failed: {error}")));
+        let corpo_json = serde_json::to_value(&request).map_err(|error| boxed(error.to_string()))?;
+        // Registra o corpo exato enviado. Sem isso não dá para saber em QUAL campo a API
+        // reclamou: a mensagem "O OID do hash 'cert-1' é inválido" cita o `id` da entrada,
+        // e sem ver o JSON completo fica ambíguo se `id` foi lido como OID ou se só nomeia
+        // a entrada cujo `hash_algorithm` foi recusado.
+        debug_log(&format!("  -> corpo enviado: {corpo_json}"));
+
+        let mut renovou = false;
+        let http = loop {
+            let tentativa = ureq::post(&self.state.url("sign"))
+                .set("Authorization", &format!("Bearer {token}"))
+                .send_json(corpo_json.clone());
+            match tentativa {
+                Ok(response) => break response,
+                // HTTP 401 = a sessão do broker venceu. O token fica em cache no módulo
+                // enquanto o processo do assinador vive, mas o broker descarta a sessão
+                // quando o access_token da SafeWeb expira (lifetime de 300s no
+                // pwd_authorize). Sem renovar aqui, TODA assinatura seguinte falha até o
+                // assinador ser reiniciado — inclusive assinatura de documento, que é o
+                // caso de uso principal. Renova uma vez e repete a requisição.
+                Err(ureq::Error::Status(401, _)) if !renovou => {
+                    renovou = true;
+                    debug_log("  -> sessao expirada (401); renovando o token e tentando de novo");
+                    if let Err(error) = self.state.logout() {
+                        debug_log(&format!("  -> falhou ao limpar o token: {error}"));
+                        return Err(error);
+                    }
+                    token = match self.state.token_or_login() {
+                        Ok(token) => token,
+                        Err(error) => {
+                            debug_log(&format!("  -> falhou ao renovar o token: {error}"));
+                            return Err(error);
+                        }
+                    };
+                }
+                Err(ureq::Error::Status(code, response)) => {
+                    let corpo = response.into_string().unwrap_or_default();
+                    debug_log(&format!("  -> servidor recusou a assinatura: HTTP {code} corpo={corpo}"));
+                    return Err(boxed(format!("remote signature failed: HTTP {code}: {corpo}")));
+                }
+                Err(error) => {
+                    debug_log(&format!("  -> falha de rede ao assinar: {error}"));
+                    return Err(boxed(format!("remote signature failed: {error}")));
+                }
             }
         };
         let bruto = http
@@ -594,6 +673,25 @@ fn boxed(message: impl Into<String>) -> Box<dyn std::error::Error> {
     Box::new(std::io::Error::other(message.into()))
 }
 
+/// Converte um erro do `ureq` em mensagem legível, **lendo o corpo da resposta** quando o
+/// servidor devolveu status de erro.
+///
+/// Por que isso é necessário: o `Display` do `ureq::Error::Status` produz apenas
+/// "http://.../v1/session/login: status code 401" e descarta o corpo. O broker coloca
+/// justamente no corpo a causa real (`message`), o erro original do provedor
+/// (`upstream_body`) e a instrução de correção (`hint`) — tudo isso se perdia, e o log
+/// ficava com um número de status que não diz o que fazer. Mesmo motivo do try/catch em
+/// `broker.ts`: o erro só é útil se a causa sobreviver até quem lê o log.
+fn erro_do_broker(contexto: &str, error: ureq::Error) -> Box<dyn std::error::Error> {
+    match error {
+        ureq::Error::Status(code, response) => {
+            let corpo = response.into_string().unwrap_or_default();
+            boxed(format!("{contexto}: HTTP {code}: {corpo}"))
+        }
+        outro => boxed(format!("{contexto}: {outro}")),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn C_GetFunctionList(
     ppFunctionList: CK_FUNCTION_LIST_PTR_PTR,
@@ -659,7 +757,16 @@ fn debug_log(line: &str) {
     if let Ok(path) = std::env::var("MYCERT_PKCS11_LOG") {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{}", line);
+            // Horário LOCAL, com milissegundos e a data junto. A data importa porque o
+            // arquivo é aberto em append e acumula sessões de dias diferentes; os
+            // milissegundos mostram quanto tempo cada chamada à rede levou (a diferença
+            // entre a linha "enviando" e a linha da resposta).
+            let _ = writeln!(
+                file,
+                "[{}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                line
+            );
         }
     }
 }

@@ -46,13 +46,42 @@ async function handle(request: http.IncomingMessage, response: http.ServerRespon
   // POST /ca/callback/:token
   if (segments[0] === 'ca' && segments[1] === 'callback' && request.method === 'POST') {
     const token = segments[2];
+    // Registra TODA tentativa de entrega, antes de qualquer validação. Sem isto, um
+    // callback recusado (token errado, corpo sem `state`, JSON inválido) sumia em
+    // silêncio: o servidor respondia 400/404 e não deixava rastro, então "o callback
+    // não chegou" e "o callback chegou e foi recusado" ficavam indistinguíveis nos logs.
+    log('callback recebido', {
+      tokenConfere: token === TOKEN,
+      origem: request.headers['x-forwarded-for'] ?? request.socket.remoteAddress,
+      contentType: request.headers['content-type'],
+    });
     if (token !== TOKEN) {
+      log('callback RECUSADO: token na URL não confere');
       // Não revela se o token existe ou não; só responde 404 igual a uma rota inexistente.
       json(response, 404, { message: 'Não encontrado' });
       return;
     }
-    const body = await readJson<CallbackBody>(request);
+    let body: CallbackBody;
+    try {
+      body = await readJson<CallbackBody>(request);
+    } catch (error) {
+      log('callback RECUSADO: corpo ilegível', { erro: String(error) });
+      json(response, 400, { message: 'Corpo inválido' });
+      return;
+    }
+    // Só os NOMES dos campos e se vieram preenchidos. O `identifierCA` nunca é logado:
+    // combinado com o PIN do titular ele autentica a assinatura — é credencial, não dado
+    // de diagnóstico. Os nomes bastam para descobrir se o SafeWeb mudou o contrato.
+    log('callback: campos recebidos', {
+      campos: Object.keys(body ?? {}),
+      temState: Boolean(body?.state),
+      temIdentifierCA: Boolean(body?.identifierCA),
+      tamanhoIdentifierCA: body?.identifierCA?.length ?? 0,
+      serialNumber: body?.serialNumber,
+      error: body?.error,
+    });
     if (!body.state) {
+      log('callback RECUSADO: corpo sem `state` — nada foi gravado');
       json(response, 400, { message: 'state é obrigatório' });
       return;
     }
@@ -72,7 +101,7 @@ async function handle(request: http.IncomingMessage, response: http.ServerRespon
       return;
     }
     store.save(record);
-    console.log(`[callback] state=${body.state} status=${record.status}`);
+    log('callback GRAVADO', { state: body.state, status: record.status, receivedAt });
     // O corpo da resposta aqui não importa para o SafeID; 200 já confirma o recebimento.
     json(response, 200, { ok: true });
     return;
@@ -92,9 +121,15 @@ async function handle(request: http.IncomingMessage, response: http.ServerRespon
     }
     const record = store.get(decodeURIComponent(state));
     if (!record) {
+      // Logar a consulta vazia é o que permite distinguir "o desktop nem perguntou" de
+      // "perguntou e não havia nada" — e, cruzando com as linhas de 'callback GRAVADO',
+      // saber se o registro nunca chegou ou se sumiu entre a gravação e a consulta
+      // (disco efêmero some a cada restart no plano free do Render).
+      log('consulta de status SEM registro', { statesConhecidos: store.states().length });
       json(response, 404, { message: 'Ainda não há callback registrado para este state' });
       return;
     }
+    log('consulta de status: registro encontrado', { status: record.status, receivedAt: record.receivedAt });
     json(response, 200, record);
     return;
   }
@@ -113,6 +148,13 @@ async function readJson<T>(request: http.IncomingMessage): Promise<T> {
   }
   const text = Buffer.concat(chunks).toString('utf8');
   return (text ? JSON.parse(text) : {}) as T;
+}
+
+// Log com horário ISO e contexto estruturado. O Render carimba a própria data nas linhas,
+// mas o carimbo daqui sobrevive a exportar/colar o log em outro lugar.
+function log(mensagem: string, contexto?: Record<string, unknown>): void {
+  const detalhe = contexto ? ` ${JSON.stringify(contexto)}` : '';
+  console.log(`[${new Date().toISOString()}] ${mensagem}${detalhe}`);
 }
 
 function json(response: http.ServerResponse, status: number, body: unknown): void {

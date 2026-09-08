@@ -86,14 +86,50 @@ para forçar quem for hospedar a escolher segredos próprios).
   demonstração pública do provedor, que motivou a arquitetura de callback
   próprio.
 
-## Limitação conhecida
+## Limitação conhecida (causa ainda em investigação)
 
-O login por certificado em alguns assinadores (ex.: PJeOffice Pro) assina o
+O login por certificado em alguns assinadores (ex.: **PJeOffice Pro**) assina o
 desafio de autenticação com **MD5withRSA**. O algoritmo é definido pelo
-próprio assinador — o MyCert não tem como alterá-lo. Se a API de assinatura
-do provedor não aceitar esse OID de hash específico, esse cenário de login
-não funciona, mesmo com o restante da integração operando normalmente (como
-comprovado com o assinador do SERPRO, usando SHA-256).
+próprio assinador — o MyCert não tem como alterá-lo. Esse fluxo hoje falha.
+
+**A hipótese principal**, informada pela SafeWeb (suporte, chamado #1266615):
+a API SafeID só aceita os OIDs de **SHA-1** e **SHA-256**; MD5 não é
+suportado e não existe fluxo alternativo. É a explicação mais provável — mas
+ainda **não foi confirmada por um erro observado**, pelos dois motivos
+abaixo.
+
+**1. A evidência estava sendo destruída pelo próprio código.** Quando a
+assinatura MD5 falha, a API devolve HTTP 400. O broker convertia isso em
+`HTTP 500 {"message":"API respondeu HTTP 400"}` — o corpo da resposta do
+provedor, única evidência do motivo real da recusa, era descartado antes de
+chegar ao log. Corrigido em `desktop/src/broker.ts` (agora propaga
+`upstream_status`/`upstream_body`) e `desktop/src/api-client.ts` (agora lê
+`Message`, `error_description` e outras chaves além de `message`), mas o
+fluxo ainda **não foi reexecutado** com a instrumentação nova.
+
+**2. Os testes bem-sucedidos não passam pelo mesmo caminho de código.** A
+biblioteca anuncia `CKM_SHA256_RSA_PKCS` e `CKM_SHA1_RSA_PKCS`, então o
+SunPKCS11 usa esses mecanismos diretamente e `prepare_hash` calcula o hash nos
+branches `RsaPkcs1v15Sha256`/`Sha1`. Não existe `CKM_MD5_RSA_PKCS` na lista,
+então MD5withRSA cai no fallback `CKM_RSA_PKCS`, em que o Java entrega um
+`DigestInfo` pronto e o código passa por `RsaPkcs1v15Raw` →
+`split_digest_info` — um branch que **nunca teve sucesso confirmado contra a
+API real**. Ou seja: "SHA-256 funciona e MD5 não" compara dois caminhos
+distintos, e não isola o algoritmo como causa.
+
+**Experimento que decide a questão:** remover temporariamente
+`CKM_SHA256_RSA_PKCS` da lista de mecanismos anunciados força o SHA-256 pelo
+mesmo caminho raw do MD5. Se a API aceitar, o caminho raw está correto e a
+recusa é mesmo do MD5 — limitação externa, nada a corrigir aqui. Se recusar
+igual, o problema está no payload do caminho raw, e é corrigível neste
+projeto.
+
+**O que está validado de fato.** Em *Teste de Dispositivos* do PJeOffice Pro,
+a biblioteca foi carregada, o certificado lido e a assinatura concluída com
+**SHA256withRSA** e **SHA1withRSA**. A assinatura de documentos foi validada
+de ponta a ponta num assinador real (SERPRO), com SHA-256 e formato RAW. O
+cenário de uso mais comum de um certificado digital, portanto, funciona
+normalmente.
 
 ## Segurança
 

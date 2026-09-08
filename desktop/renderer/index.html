@@ -69,8 +69,9 @@
         <div class="section-heading"><span class="step">03</span><div><h3>Certificado e token</h3><p>Dados públicos usados pelo módulo nativo.</p></div></div>
         <div class="two-col"><label>Alias do certificado<input id="certificateAlias" type="text" placeholder="Ex.: e-CPF principal" /></label><label>ID do certificado<input id="certificateId" type="text" /></label></div>
         <label>Caminho da biblioteca PKCS#11<input id="modulePath" type="text" placeholder="Será preenchido ao instalar a configuração" /></label>
-                  <label>Certificados em JSON <span class="label-help">(manual; use DER em Base64)</span><textarea id="certificates" rows="7" spellcheck="false" placeholder='[{"id":"cert-1","alias":"Meu certificado","der_b64":"...","public_key_der_b64":"...","algorithm":"RSA"}]'></textarea></label>
-        <p class="hint">A demonstração 2 não possui uma rota de listagem de certificados. Informe aqui os dados públicos fornecidos pela API/PSC em DER convertido para Base64. A chave privada nunca é armazenada.</p>
+                  <label>Certificados em JSON <span class="label-help">(manual; use DER em Base64)</span><textarea id="certificates" rows="7" spellcheck="false" placeholder='[{"id":"cert-1","alias":"Meu certificado","der_b64":"...","algorithm":"RSA","chain_der_b64":["...AC emissora...","...AC raiz..."]}]'></textarea></label>
+        <p class="hint">Informe aqui os dados públicos do certificado em DER convertido para Base64. A chave privada nunca é armazenada.</p>
+        <p class="hint"><strong>chain_der_b64</strong> (opcional, mas recomendado): lista com os certificados intermediários da cadeia (AC emissora e ACs acima dela), também em DER Base64. Sem eles, assinadores reportam "Cadeia de Certificados: AUSENTE". Os certificados da cadeia podem ser baixados no repositório da AC — a URL costuma estar dentro do próprio certificado do titular, na extensão <em>Authority Information Access</em>.</p>
         <button class="primary full" id="save-certificate" type="button">Salvar certificado e metadados</button>
       </section>
 

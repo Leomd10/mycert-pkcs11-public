@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
-import { ApiError, authorizeCA, joinUrl, pollAuthorization } from './api-client';
+import { ApiError, authorizeCA, ensureCallbackServerAwake, joinUrl, pollAuthorization } from './api-client';
 import { LocalBroker } from './broker';
 import { SecureStore, type MyCertConfig } from './secure-store';
 
@@ -43,9 +43,35 @@ function registerIpc(): void {
   ipcMain.handle('config:save', (_event, patch: Partial<MyCertConfig>) => store.save(patch));
   ipcMain.handle('config:reset', () => store.reset());
   ipcMain.handle('authorization:start', async (_event, document: string) => {
-    const config = store.save({ document });
+    // Marca o início ANTES de disparar o push: qualquer callback gravado antes deste
+    // instante é de uma autorização anterior, e `pollAuthorization` vai recusá-lo em vez
+    // de devolver um identifierCA já revogado como se fosse novo.
+    const config = store.save({ document, authorizationStartedAt: new Date().toISOString() });
     const endpoint = joinUrl(config.oauthBaseUrl, 'authorize-ca');
     const redirectUri = config.redirectUri.trim() || joinUrl(config.demoApiBaseUrl, 'CA/CallbackCA');
+    // Confirma que o receptor do callback está de pé antes de gastar um push do titular.
+    // Autorizar com o servidor fora do ar cria uma autorização do lado do provedor que
+    // nunca vai poder ser lida — ver `ensureCallbackServerAwake`.
+    const callback = await ensureCallbackServerAwake(config);
+    console.log('Verificação do servidor de callback:', callback);
+    if (!callback.ok) {
+      return {
+        content: false,
+        status: 0,
+        message:
+          `O servidor de callback não respondeu (${callback.detalhe ?? 'sem detalhe'}) após `
+          + `${callback.tentativas} tentativa(s) em ${Math.round(callback.ms / 1000)}s. `
+          + 'A autorização NÃO foi iniciada — sem esse servidor no ar, o provedor não teria '
+          + 'onde entregar o identifierCA e o push no celular seria desperdiçado.',
+        _diagnostics: {
+          httpStatus: 0,
+          endpoint: joinUrl(config.callbackServerUrl || '(não configurado)', 'health'),
+          redirectUri,
+          request: 'GET /health (pré-checagem)',
+          response: callback,
+        },
+      };
+    }
     try {
       return await authorizeCA(config, document);
     } catch (error) {

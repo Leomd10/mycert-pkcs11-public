@@ -10,6 +10,9 @@ export interface AuthorizationRecord {
   identifierCA: string;
   serialNumber?: string;
   expirationDate?: string;
+  // Quando o callback-server recebeu este callback. É o que permite distinguir a
+  // autorização em curso de uma anterior ainda em cache — ver `pollAuthorization`.
+  receivedAt?: string;
 }
 
 export interface SessionToken {
@@ -33,6 +36,28 @@ function joinUrl(base: string, suffix: string): string {
   return `${base.replace(/\/$/, '')}/${suffix.replace(/^\//, '')}`;
 }
 
+// O SafeWeb é uma stack .NET: dependendo do ponto onde a requisição é recusada, a
+// mensagem vem em `message`, `Message` (padrão do ASP.NET), `error_description`
+// (padrão OAuth) ou `title`/`detail` (RFC 7807). Só olhávamos `message` minúsculo —
+// nos outros casos a causa real era descartada e sobrava o genérico "API respondeu
+// HTTP 400", que não diz nada sobre o motivo da recusa.
+const CHAVES_DE_MENSAGEM = ['message', 'Message', 'error_description', 'error', 'title', 'detail'];
+
+function extractMessage(body: unknown, status: number): string {
+  if (typeof body === 'string' && body.trim()) return body.trim();
+  if (typeof body === 'object' && body !== null) {
+    const registro = body as Record<string, unknown>;
+    for (const chave of CHAVES_DE_MENSAGEM) {
+      const valor = registro[chave];
+      if (typeof valor === 'string' && valor.trim()) return valor.trim();
+    }
+    // Último recurso: nenhuma chave conhecida, mas há corpo. Devolve o JSON inteiro em
+    // vez de engolir — é justamente esse corpo que identifica a causa da recusa.
+    return `API respondeu HTTP ${status}: ${JSON.stringify(body)}`;
+  }
+  return `API respondeu HTTP ${status}`;
+}
+
 async function requestJsonWithMeta<T>(url: string, init: RequestInit = {}): Promise<{ status: number; body: T }> {
   const response = await fetch(url, {
     ...init,
@@ -50,10 +75,7 @@ async function requestJsonWithMeta<T>(url: string, init: RequestInit = {}): Prom
     body = text;
   }
   if (!response.ok) {
-    const message = typeof body === 'object' && body !== null && 'message' in body
-      ? String((body as { message: unknown }).message)
-      : `API respondeu HTTP ${response.status}`;
-    throw new ApiError(message, response.status, body);
+    throw new ApiError(extractMessage(body, response.status), response.status, body);
   }
   return { status: response.status, body: body as T };
 }
@@ -61,6 +83,56 @@ async function requestJsonWithMeta<T>(url: string, init: RequestInit = {}): Prom
 async function requestJson<T>(url: string, init: RequestInit = {}): Promise<T> {
   const result = await requestJsonWithMeta<T>(url, init);
   return result.body;
+}
+
+export interface CallbackServerCheck {
+  ok: boolean;
+  tentativas: number;
+  ms: number;
+  detalhe?: string;
+}
+
+/**
+ * Acorda e confirma o servidor de callback ANTES de iniciar a autorização.
+ *
+ * Por que isso importa: o fluxo não tem polling do lado da SafeWeb — a entrega do
+ * `identifierCA` é um POST único, sem retentativa conhecida. Se o servidor de callback
+ * estiver hibernando quando esse POST chegar (hospedagens gratuitas derrubam o serviço
+ * após alguns minutos ociosos e levam 30-60s para subir), a entrega se perde em
+ * silêncio — e a autorização, que já consumiu um push no celular do titular e já existe
+ * do lado do provedor, vira lixo. O usuário só descobre minutos depois, quando o
+ * polling estoura as 60 tentativas, ou pior: mais tarde, na hora de assinar.
+ *
+ * Uma requisição ao /health antes do `authorize-ca` resolve: ela mesma tira o serviço da
+ * hibernação, e o polling subsequente (a cada 3s) o mantém acordado durante toda a
+ * janela em que o callback pode chegar.
+ */
+export async function ensureCallbackServerAwake(config: MyCertConfig): Promise<CallbackServerCheck> {
+  const base = config.callbackServerUrl.trim();
+  const inicio = Date.now();
+  if (!base) {
+    return { ok: false, tentativas: 0, ms: 0, detalhe: 'Servidor de callback não configurado.' };
+  }
+  const url = joinUrl(base, 'health');
+  // Janela generosa: um cold start de hospedagem gratuita leva de 30 a 60 segundos.
+  const LIMITE_MS = 90_000;
+  const ESPERA_ENTRE_TENTATIVAS_MS = 5_000;
+  let tentativas = 0;
+  let detalhe = '';
+  while (Date.now() - inicio < LIMITE_MS) {
+    tentativas += 1;
+    try {
+      const resposta = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (resposta.ok) {
+        return { ok: true, tentativas, ms: Date.now() - inicio };
+      }
+      detalhe = `HTTP ${resposta.status}`;
+    } catch (error) {
+      detalhe = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise((resolve) => setTimeout(resolve, ESPERA_ENTRE_TENTATIVAS_MS));
+  }
+  return { ok: false, tentativas, ms: Date.now() - inicio, detalhe };
 }
 
 export async function authorizeCA(config: MyCertConfig, document: string): Promise<AuthorizationResult & { _diagnostics?: Record<string, unknown> }> {
@@ -118,15 +190,38 @@ export async function pollAuthorization(config: MyCertConfig, document: string):
     identifierCA?: string;
     expirationDate?: string;
     serialNumber?: string;
+    receivedAt?: string;
     error?: string;
   }>(joinUrl(config.callbackServerUrl, `ca/status/${config.callbackToken.trim()}/${encodeURIComponent(document)}`));
   if (record.status === 'denied') {
     throw new ApiError(`Autorização negada pelo titular (${record.error ?? 'user_denied'}).`, 409, record);
   }
+  // O callback-server indexa os registros pelo `state`, que é o CPF, e os mantém por 24h.
+  // Uma consulta feita antes de o callback novo chegar devolve o registro da autorização
+  // ANTERIOR — mesmo CPF, identifierCA velho. Aceitá-lo parecia sucesso aqui e só
+  // estourava lá na frente, no pwd_authorize, como "Esta solicitação não está ativa ou
+  // foi revogada". Então: só vale registro recebido depois do início desta autorização.
+  const iniciadaEm = Date.parse(config.authorizationStartedAt);
+  const recebidoEm = Date.parse(record.receivedAt ?? '');
+  if (Number.isFinite(iniciadaEm)) {
+    // Tolerância para diferença de relógio entre esta máquina e o callback-server, que
+    // são hosts distintos. Folga pequena: o caso que isto pega são registros de horas
+    // atrás, não de segundos.
+    const TOLERANCIA_RELOGIO_MS = 2 * 60 * 1000;
+    if (!Number.isFinite(recebidoEm) || recebidoEm < iniciadaEm - TOLERANCIA_RELOGIO_MS) {
+      throw new ApiError(
+        `O callback disponível é de uma autorização anterior (recebido em ${record.receivedAt ?? 'data desconhecida'}). `
+          + 'Aguardando o push desta autorização ser aprovado no celular.',
+        409,
+        record,
+      );
+    }
+  }
   return {
     identifierCA: record.identifierCA ?? '',
     serialNumber: record.serialNumber,
     expirationDate: record.expirationDate,
+    receivedAt: record.receivedAt,
   };
 }
 

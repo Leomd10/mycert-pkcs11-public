@@ -99,6 +99,10 @@
     if (!pendingDocument) return;
     try {
       await window.mycert.saveConfig({ ...readPatch(), document: pendingDocument });
+      // O início agora acorda e confere o servidor de callback antes de disparar o push,
+      // o que pode levar até 90s se ele estiver hibernando. Sem avisar aqui, a tela
+      // ficaria muda esse tempo todo e pareceria travada.
+      setStatus('Verificando o servidor de callback', 'Confirmando que o receptor do callback está no ar antes de gastar o push do titular. Pode levar até 90s se ele estiver hibernando.', 'active');
       const started = await window.mycert.startAuthorization(pendingDocument);
       showAuthorizationResponse(started);
       if (started && started.content === false) {
@@ -130,7 +134,11 @@
         // Qualquer outro status (401/403/500/erro de rede) é um problema real de
         // configuração (host errado, credencial errada etc.) e não vai se resolver
         // sozinho — parar de tentar e mostrar o erro em vez de ficar "aguardando" 180s.
-        if (record.status === 404) {
+        // 409 = há registro, mas de uma autorização ANTERIOR (o callback-server indexa
+        // pelo CPF e guarda 24h). Também é estado de espera, não falha: o callback desta
+        // autorização ainda não chegou. Tratar como erro fatal aqui abortaria o polling
+        // justamente no caso em que basta esperar mais alguns segundos.
+        if (record.status === 404 || record.status === 409) {
           setStatus('Aguardando confirmação no dispositivo', `Consultando o callback… tentativa ${attempt + 1}/60.`, 'active');
           continue;
         }

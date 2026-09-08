@@ -20,6 +20,11 @@ once_cell = "1"
 ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 sha1 = "0.10"
 sha2 = "0.10"
+# Só para carimbar horário local nas linhas do MYCERT_PKCS11_LOG. A std do Rust não
+# expõe fuso local, e é o horário local que permite cruzar este log com o do PJeOffice
+# (que registra "06/09/2026 20:02:14 UTC-04:00"). `clock` é a única feature necessária;
+# o resto do chrono fica de fora.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Só usada para extrair modulus/expoente público da chave pública (SubjectPublicKeyInfo
 # em DER) e devolver via CKA_MODULUS/CKA_PUBLIC_EXPONENT — o SunPKCS11 do Java exige
 # esses dois atributos na própria chave privada pra montar o objeto de chave (P11Key),
