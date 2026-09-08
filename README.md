@@ -88,53 +88,89 @@ para forçar quem for hospedar a escolher segredos próprios).
 
 ## Limitação conhecida
 
-O login por certificado em alguns assinadores (ex.: **PJeOffice Pro**) assina o
-desafio de autenticação com **MD5withRSA**. O algoritmo é definido pelo próprio
-assinador — o MyCert não tem como alterá-lo. Esse fluxo **não é viável hoje**,
-por recusa do provedor.
+O login por certificado no **PJeOffice Pro** não funciona com certificados em
+nuvem. O desafio de autenticação é assinado com **MD5withRSA**, e provedores
+ICP-Brasil não assinam com o OID de MD5.
 
-**Confirmado pela mensagem de erro da própria API SafeWeb**, obtida com o log
-detalhado (`MYCERT_PKCS11_LOG`):
+**A origem não é o PJeOffice nem o provedor do certificado: é a aplicação
+servidora do PJe.** Os três componentes foram verificados e cada um está
+correto no próprio escopo.
+
+### A cadeia, verificada
+
+O PJeOffice executa a tarefa `sso.autenticador`, cujo contrato
+(`ITarefaAutenticador`) expõe o campo `algoritmoAssinatura`. O cliente
+JavaScript de referência distribuído com o próprio assinador
+(`welcome/pjeoffice-pro.js`) define:
+
+```js
+"ALGORITMO_AUTENTICACAO" : "SHA256withRSA",
+```
+
+Ou seja, **o padrão oficial do PJeOffice para autenticação é SHA-256**. O
+`MD5withRSA` aparece apenas como fallback legado da `PjeAuthenticatorTask`
+quando o campo não é enviado. No fluxo real, porém, o log registra
+`Algoritmo: 'MD5WITHRSA'` — porque o backend do PJe pede MD5 explicitamente.
+
+Confirmado pela **Equipe PJeOffice Pro** (suporte):
+
+> "O PJeOffice Pro já possui suporte a algoritmos criptográficos mais
+> modernos, incluindo o SHA256withRSA. Entretanto, o algoritmo utilizado no
+> fluxo de autenticação não é definido ou negociado pelo assinador. [...]
+> Atualmente, nesse fluxo, o backend solicita a assinatura utilizando
+> MD5withRSA."
+
+E pela **SafeWeb** (chamado #1266615), cuja recusa aparece literalmente na
+resposta da API, capturada com `MYCERT_PKCS11_LOG`:
 
 ```
 O OID do hash é inválido.
   at PSC.Business.SignatureBusiness.Sign(...) in ...\SignatureBusiness.cs:line 108
 ```
 
-Bate com o que o suporte da SafeWeb informou no chamado #1266615: a API SafeID
-aceita apenas os OIDs de **SHA-1** e **SHA-256**, e não há fluxo alternativo.
-
-### Por que a causa é o algoritmo, e não o nosso payload
+### Por que o MyCert não tem o que corrigir
 
 O PJeOffice usa um provider JCA próprio (`ANYwithRSASignature`), que calcula o
 digest em Java e faz o RSA cru via `Cipher`/`P11RSACipher`. Isso força
-`CKM_RSA_PKCS` **em todos os algoritmos** — a lista de mecanismos que a
-biblioteca anuncia é irrelevante nesse fluxo. Logo, SHA-256 e MD5 percorrem
-exatamente o mesmo caminho aqui: `prepare_hash` → `RsaPkcs1v15Raw` →
-`split_digest_info`, e `sign()` monta a requisição com os mesmos campos.
+`CKM_RSA_PKCS` em **todos** os algoritmos — SHA-256 e MD5 percorrem aqui
+exatamente o mesmo caminho: `prepare_hash` → `RsaPkcs1v15Raw` →
+`split_digest_info`. Comparando as duas execuções, só o OID difere:
 
-Comparando as duas execuções, só uma coisa difere:
+| Algoritmo | `hash_algorithm` enviado | Resposta da API |
+|---|---|---|
+| SHA256withRSA | `2.16.840.1.101.3.4.2.1` | ✅ assinatura devolvida |
+| MD5withRSA | `1.2.840.113549.2.5` | ❌ "O OID do hash é inválido" |
 
-| Algoritmo | `id` enviado | `hash_algorithm` | Resultado da API |
-|---|---|---|---|
-| SHA256withRSA | `cert-1` | `2.16.840.1.101.3.4.2.1` | ✅ assinatura devolvida |
-| MD5withRSA | `cert-1` | `1.2.840.113549.2.5` | ❌ "O OID do hash é inválido" |
+Com o restante do payload idêntico, a recusa isola o OID como causa — e
+confirma que o caminho raw está correto, já que produziu uma requisição que a
+API aceitou. **Se o PJe passar a pedir SHA256withRSA, o login funciona sem
+nenhuma alteração neste projeto.**
 
-Com o restante do payload idêntico, a recusa isola o OID como causa. Isso
-também confirma que o caminho `RsaPkcs1v15Raw` está correto: ele produziu uma
-requisição que a API aceitou.
+### Não há contorno pelo lado do cliente
+
+Trocar o algoritmo apenas na chamada do cliente não resolve: a aplicação
+servidora também precisa verificar a assinatura com o novo algoritmo. Nas
+palavras do suporte do PJeOffice, a adequação "não se resume à substituição do
+algoritmo na requisição, pois os componentes responsáveis pelo processamento e
+pela validação também precisam estar preparados". Converter hash também é
+impossível — MD5 e SHA-256 são funções distintas, e o PJe verifica
+matematicamente a assinatura sobre aquele hash MD5 específico.
+
+**Situação:** as tratativas para migrar o fluxo para SHA-256 já estão em
+andamento no CNJ. Acompanhamento pelo canal oficial
+(https://suporteti.cnj.jus.br/), registrando que **não** se trata de demanda
+para o assinador PJeOffice Pro.
 
 ### O que funciona normalmente
 
 *Teste de Dispositivos* do PJeOffice Pro com **SHA256withRSA** e
 **SHA1withRSA**: biblioteca carregada, certificado lido, assinatura concluída.
 Assinatura de documentos validada de ponta a ponta num assinador real (SERPRO),
-com SHA-256 e formato RAW. O cenário de uso mais comum de um certificado
-digital, portanto, funciona.
+com SHA-256 e formato RAW.
 
-Se o PJeOffice Pro vier a permitir configurar o algoritmo do `sso.autenticador`,
-ou migrar para SHA-256, **nenhuma mudança neste projeto será necessária** — o
-suporte já está implementado e testado.
+Enquanto o fluxo de login não é adequado, o caminho de uso é entrar no PJe por
+senha/CPF ou gov.br e usar o certificado, via MyCert, para **assinar** dentro
+do processo — que é o cenário mais comum e funciona com SHA-256.
 
 ## Segurança
 
