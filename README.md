@@ -14,6 +14,8 @@ assinatura para a API do provedor via um serviço local.
 | `desktop/` | App Electron: autorização do titular (push), armazenamento seguro da configuração, geração do `.cfg` do SunPKCS11 | Electron + TypeScript |
 | `desktop/src/broker.ts` | Servidor HTTP local (`127.0.0.1:47891`), único ponto que fala com a internet — troca `identifierCA` por token de sessão e encaminha assinaturas para a API OAuth real do provedor | Node.js |
 | `pkcs11/` | Biblioteca nativa (`.dll` / `.dylib` / `.so`) que implementa a interface PKCS#11 (Cryptoki): sessões, listagem de certificados, atributos de chave RSA, assinatura | Rust + [`native-pkcs11`](https://github.com/google/native-pkcs11) |
+| `ksp/` | Key Storage Provider do Windows (CNG): põe o certificado no repositório do Windows, para Edge, Chrome e demais programas que não carregam PKCS#11 | Rust + `windows-sys` |
+| `broker-client/` | Cliente do broker local compartilhado por `pkcs11/` e `ksp/`: login, renovação da sessão e envio do hash | Rust |
 | `callback-server/` | Serviço HTTP mínimo, hospedado publicamente, que recebe o callback assíncrono do provedor após o titular aprovar a autorização no celular | Node.js (sem dependências) |
 | `.github/workflows/` | Pipeline que compila e testa o módulo `pkcs11` num runner macOS real | GitHub Actions |
 
@@ -70,6 +72,48 @@ Para testar a biblioteca fora de um assinador de verdade, veja
 `.github/workflows/test-pkcs11-macos.yml` (compila, roda os testes unitários
 do módulo e testa a `.dylib` com `keytool` num runner macOS real, sem
 precisar de hardware Apple).
+
+## Repositório do Windows (KSP)
+
+No Windows, Edge e Chrome não carregam módulos PKCS#11: só enxergam
+certificados do repositório do Windows. O `ksp/` resolve isso do mesmo jeito
+que o SafeID Desktop: registra um *Key Storage Provider* ("MyCert Key Storage
+Provider") e vincula o certificado a ele (`CERT_KEY_PROV_INFO`, chave
+`mycert-<thumbprint>`). Quando um programa assina, o Windows carrega
+`System32\mycert_ksp.dll`, que encaminha o hash ao broker local, igual ao
+`C_Sign` do módulo PKCS#11.
+
+```bash
+cd ksp
+cargo build --release
+```
+
+Com o app MyCert aberto:
+
+```bash
+# uma vez, num terminal de administrador
+target/release/mycert-ksp-tool instalar
+# como usuário comum
+target/release/mycert-ksp-tool importar
+target/release/mycert-ksp-tool testar
+```
+
+`testar` passa pelo mesmo caminho de um navegador (NCrypt → DLL registrada →
+broker) e confere a assinatura com a chave pública do certificado. `remover`
+desfaz o vínculo e `desinstalar` tira o provedor do sistema.
+
+Só PKCS#1: a API do provedor recusa `signature_format: "PSS"` ("O
+signature_format do hash é inválido"), então o KSP responde
+`NTE_NOT_SUPPORTED` a pedidos PSS sem ir à rede.
+
+**Mesmo certificado no SafeID:** o repositório guarda um único provedor por
+certificado. Se o SafeID Desktop já vinculou o certificado, `importar` avisa e
+não mexe. `importar --substituir` troca o vínculo e guarda o anterior em
+`%LOCALAPPDATA%\MyCert\ksp-vinculos-anteriores`; `remover` o restaura. Com o
+SafeID Desktop aberto, ele pode refazer o próprio vínculo.
+
+O log é o mesmo `MYCERT_PKCS11_LOG` do módulo PKCS#11, com as linhas do
+provedor marcadas `KSP <programa>#<pid>`.
 
 ## Servidor de callback
 
@@ -167,6 +211,16 @@ para o assinador PJeOffice Pro.
 **SHA1withRSA**: biblioteca carregada, certificado lido, assinatura concluída.
 Assinatura de documentos validada de ponta a ponta num assinador real (SERPRO),
 com SHA-256 e formato RAW.
+
+**Login por certificado no navegador** (gov.br): validado no Firefox com o
+módulo PKCS#11. Quem assina é o próprio navegador, no handshake TLS, com
+SHA-256 — o PJeOffice não participa. No Edge e no Chrome, o mesmo login passa
+pelo KSP (ver "Repositório do Windows").
+
+O SafeID Desktop tem a mesma limitação no login do PJeOffice: o log dele
+(`%APPDATA%\SafeID Desktop\logs\main.log`) só registra pedidos SHA-256 vindos
+de navegadores, nunca MD5. O que o faz "funcionar pelo repositório do Windows"
+é o login pelo navegador, não uma assinatura MD5.
 
 Enquanto o fluxo de login não é adequado, o caminho de uso é entrar no PJe por
 senha/CPF ou gov.br e usar o certificado, via MyCert, para **assinar** dentro
