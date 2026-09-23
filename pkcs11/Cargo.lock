@@ -525,21 +525,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "mycert-pkcs11"
+name = "mycert-broker"
 version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "mycert-pkcs11"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "mycert-broker",
  "native-pkcs11",
  "native-pkcs11-traits",
  "once_cell",
  "pkcs11-sys",
  "rsa",
- "serde",
- "serde_json",
  "sha1",
  "sha2",
- "ureq",
  "x509-cert",
 ]
 

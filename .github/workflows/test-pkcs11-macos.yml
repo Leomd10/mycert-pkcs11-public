@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'pkcs11/**'
+      - 'broker-client/**'
       - '.github/workflows/test-pkcs11-macos.yml'
 
 jobs:
