@@ -18,13 +18,13 @@ use pkcs11_sys::{
 use pkcs11_sys::CK_ATTRIBUTE;
 use rsa::{pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey, traits::PublicKeyParts, RsaPublicKey};
 use x509_cert::der::{Decode, Encode};
-use serde::{Deserialize, Serialize};
+use mycert_broker::{boxed, debug_log, split_digest_info, Broker, CertificateWire, SignParams};
 use std::collections::HashMap;
 use std::sync::{Arc, Once, RwLock};
 
 static FUNCTION_LIST: OnceCell<CK_FUNCTION_LIST> = OnceCell::new();
 static BACKEND_REGISTERED: Once = Once::new();
-static BACKEND_STATE: OnceCell<Arc<BackendState>> = OnceCell::new();
+static BACKEND_STATE: OnceCell<Arc<Broker>> = OnceCell::new();
 // Guarda o (modulus, expoente público) de cada chave RSA, indexado pelo mesmo `id`
 // usado nos objetos PKCS#11 (CKA_ID). Preenchido sempre que listamos as chaves;
 // consultado pelo nosso C_GetAttributeValue quando o Java pede CKA_MODULUS ou
@@ -78,143 +78,29 @@ fn register_rsa_key_params_from_certificate(id: &[u8], certificate_der: &[u8]) {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct CertificateWire {
-    id: String,
-    #[serde(default)]
-    alias: String,
-    #[serde(default)]
-    label: String,
-    der_b64: String,
-    #[serde(default)]
-    public_key_der_b64: String,
-    #[serde(default = "default_algorithm")]
-    algorithm: String,
-}
-
-fn default_algorithm() -> String {
-    "RSA".to_string()
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct CertificatesResponse {
-    certificates: Vec<CertificateWire>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct SignResponse {
-    #[serde(default)]
-    raw_signature: Option<String>,
-    #[serde(default)]
-    signature: Option<RawSignature>,
-    #[serde(default)]
-    signatures: Vec<RawSignature>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RawSignature {
-    #[serde(default)]
-    raw_signature: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct SignRequest {
-    certificate_alias: String,
-    hashes: Vec<HashRequest>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct HashRequest {
-    id: String,
-    alias: String,
-    hash: String,
-    hash_algorithm: String,
-    signature_format: String,
-}
-
-#[derive(Debug)]
-struct BackendState {
-    broker_url: String,
-    session_token: RwLock<Option<String>>,
-}
-
-impl BackendState {
-    fn new() -> Self {
-        let broker_url = std::env::var("MYCERT_BROKER_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:47891".to_string())
-            .trim_end_matches('/')
-            .to_string();
-        Self { broker_url, session_token: RwLock::new(None) }
-    }
-
-    fn url(&self, path: &str) -> String {
-        format!("{}/v1/{}", self.broker_url, path.trim_start_matches('/'))
-    }
-
-    fn login(&self, pin: Option<&str>) -> BackendResult<()> {
-        let response: BrokerLoginResponse = ureq::post(&self.url("session/login"))
-            .send_json(serde_json::json!({ "pin": pin }))
-            .map_err(|error| boxed(format!("broker login failed: {error}")))?
-            .into_json()
-            .map_err(|error| boxed(format!("invalid broker login response: {error}")))?;
-        *self.session_token.write().map_err(|_| boxed("session lock poisoned"))? =
-            Some(response.access_token);
-        Ok(())
-    }
-
-    fn logout(&self) -> BackendResult<()> {
-        *self.session_token.write().map_err(|_| boxed("session lock poisoned"))? = None;
-        Ok(())
-    }
-
-    fn token(&self) -> BackendResult<String> {
-        self.session_token
-            .read()
-            .map_err(|_| boxed("session lock poisoned"))?
-            .clone()
-            .ok_or_else(|| boxed("PKCS#11 session is not logged in"))
-    }
-
-    /// Devolve o token de sessão, fazendo login automaticamente se ainda não houver um.
-    ///
-    /// Por que isso é necessário: o SunPKCS11 só chama C_Login quando o token anuncia que
-    /// exige PIN. No fluxo de autenticação do PJe ele vai direto para a assinatura, e o
-    /// módulo ficava sem token ("PKCS#11 session is not logged in"). Como o login do MyCert
-    /// não usa PIN de verdade (o broker apenas troca a autorização já salva no app por um
-    /// token de sessão), podemos fazê-lo sob demanda, sem pedir nada ao usuário.
-    fn token_or_login(&self) -> BackendResult<String> {
-        if let Ok(token) = self.token() {
-            return Ok(token);
-        }
-        debug_log("  -> sem token de sessao; tentando login automatico no broker");
-        self.login(None)?;
-        let token = self.token()?;
-        debug_log("  -> login automatico OK");
-        Ok(token)
-    }
-
-    fn certificates(&self) -> BackendResult<Vec<CertificateWire>> {
-        let response: CertificatesResponse = ureq::get(&self.url("certificates"))
-            .call()
-            .map_err(|error| boxed(format!("certificate discovery failed: {error}")))?
-            .into_json()
-            .map_err(|error| boxed(format!("invalid certificate response: {error}")))?;
-        Ok(response.certificates)
-    }
-}
-
 #[derive(Debug)]
 struct MyCertBackend {
-    state: Arc<BackendState>,
+    state: Arc<Broker>,
 }
 
 impl MyCertBackend {
     fn certificate_objects(&self) -> BackendResult<Vec<Box<dyn Certificate>>> {
-        self.state
-            .certificates()?
-            .into_iter()
-            .map(|wire| build_certificate(wire, Arc::clone(&self.state)))
-            .collect()
+        let mut objetos: Vec<Box<dyn Certificate>> = Vec::new();
+        for wire in self.state.certificates()? {
+            // Cada certificado da cadeia também vira um objeto PKCS#11 próprio, para
+            // que o consumidor (Java/PJe) consiga montar a corrente de confiança até a
+            // raiz ICP-Brasil. Sem isso o teste do PJeOffice reporta a cadeia ausente.
+            for (indice, chain_b64) in wire.chain_der_b64.iter().enumerate() {
+                match build_chain_certificate(&wire.id, indice, chain_b64, Arc::clone(&self.state)) {
+                    Ok(certificado) => objetos.push(certificado),
+                    // Um elo inválido não pode derrubar a listagem inteira: o certificado
+                    // do titular ainda é utilizável, só a validação da cadeia fica incompleta.
+                    Err(erro) => debug_log(&format!("  -> cadeia: elo {indice} ignorado ({erro})")),
+                }
+            }
+            objetos.push(build_certificate(wire, Arc::clone(&self.state))?);
+        }
+        Ok(objetos)
     }
 }
 
@@ -323,7 +209,7 @@ impl Backend for MyCertBackend {
     }
 }
 
-fn build_certificate(wire: CertificateWire, state: Arc<BackendState>) -> BackendResult<Box<dyn Certificate>> {
+fn build_certificate(wire: CertificateWire, state: Arc<Broker>) -> BackendResult<Box<dyn Certificate>> {
     let id = wire.id.into_bytes();
     let label = non_empty(&wire.alias, &wire.label, "MyCert certificate");
     let der = STANDARD
@@ -337,6 +223,38 @@ fn build_certificate(wire: CertificateWire, state: Arc<BackendState>) -> Backend
         label: label.clone(),
         der: public_key_der,
         algorithm: parse_algorithm(&wire.algorithm),
+    };
+    Ok(Box::new(RemoteCertificate { id, label, der, public_key, _state: state }))
+}
+
+/// Monta um objeto PKCS#11 para um certificado intermediário da cadeia. A chave pública
+/// é extraída do próprio certificado (SubjectPublicKeyInfo), já que a cadeia não traz
+/// esse dado separado — e o rótulo sai do CN do emissor, para ficar reconhecível na
+/// listagem do consumidor.
+fn build_chain_certificate(
+    id_base: &str,
+    indice: usize,
+    chain_b64: &str,
+    state: Arc<Broker>,
+) -> BackendResult<Box<dyn Certificate>> {
+    let der = STANDARD
+        .decode(chain_b64.trim())
+        .map_err(|error| boxed(format!("invalid chain certificate DER: {error}")))?;
+    let certificado = x509_cert::Certificate::from_der(&der)
+        .map_err(|error| boxed(format!("invalid chain certificate: {error}")))?;
+    let spki_der = certificado
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|error| boxed(format!("invalid chain SubjectPublicKeyInfo: {error}")))?;
+
+    let id = format!("{id_base}-ca{indice}").into_bytes();
+    let label = certificado.tbs_certificate.subject.to_string();
+    let public_key = RemotePublicKey {
+        id: id.clone(),
+        label: label.clone(),
+        der: spki_der,
+        algorithm: KeyAlgorithm::Rsa,
     };
     Ok(Box::new(RemoteCertificate { id, label, der, public_key, _state: state }))
 }
@@ -365,7 +283,7 @@ struct RemoteCertificate {
     label: String,
     der: Vec<u8>,
     public_key: RemotePublicKey,
-    _state: Arc<BackendState>,
+    _state: Arc<Broker>,
 }
 
 impl Certificate for RemoteCertificate {
@@ -426,7 +344,7 @@ struct RemotePrivateKey {
     label: String,
     certificate_alias: String,
     algorithm: KeyAlgorithm,
-    state: Arc<BackendState>,
+    state: Arc<Broker>,
 }
 
 impl PrivateKey for RemotePrivateKey {
@@ -444,69 +362,15 @@ impl PrivateKey for RemotePrivateKey {
             algorithm,
             data.len()
         ));
-        let token = match self.state.token_or_login() {
-            Ok(token) => token,
-            Err(error) => {
-                debug_log(&format!("  -> falhou ao obter token de sessao: {error}"));
-                return Err(error);
-            }
-        };
         let (payload, hash_algorithm, signature_format) = prepare_hash(algorithm, data);
-        debug_log(&format!(
-            "  -> enviando hash_algorithm={} signature_format={} payload={} bytes inicio={}",
-            hash_algorithm,
-            signature_format,
-            payload.len(),
-            payload.iter().take(20).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("")
-        ));
-        let request = SignRequest {
-            certificate_alias: self.certificate_alias.clone(),
-            hashes: vec![HashRequest {
-                id: String::from_utf8_lossy(&self.id).to_string(),
-                alias: self.label.clone(),
-                hash: STANDARD.encode(payload),
-                hash_algorithm,
-                signature_format,
-            }],
-        };
-        let http = ureq::post(&self.state.url("sign"))
-            .set("Authorization", &format!("Bearer {token}"))
-            .send_json(serde_json::to_value(request).map_err(|error| boxed(error.to_string()))?);
-        let http = match http {
-            Ok(response) => response,
-            Err(ureq::Error::Status(code, response)) => {
-                let corpo = response.into_string().unwrap_or_default();
-                debug_log(&format!("  -> servidor recusou a assinatura: HTTP {code} corpo={corpo}"));
-                return Err(boxed(format!("remote signature failed: HTTP {code}: {corpo}")));
-            }
-            Err(error) => {
-                debug_log(&format!("  -> falha de rede ao assinar: {error}"));
-                return Err(boxed(format!("remote signature failed: {error}")));
-            }
-        };
-        let bruto = http
-            .into_string()
-            .map_err(|error| boxed(format!("invalid signature response: {error}")))?;
-        debug_log(&format!("  -> resposta do servidor: {bruto}"));
-        let response: SignResponse = serde_json::from_str(&bruto)
-            .map_err(|error| boxed(format!("invalid signature response: {error}")))?;
-        let value = response
-            .raw_signature
-            .or_else(|| response.signature.map(|value| value.raw_signature))
-            .or_else(|| response.signatures.into_iter().next().map(|value| value.raw_signature))
-            .ok_or_else(|| {
-                debug_log("  -> resposta sem raw_signature");
-                boxed("signature response did not contain raw_signature")
-            })?;
-        STANDARD
-            .decode(value)
-            .map_err(|error| boxed(format!("invalid raw_signature Base64: {error}")))
-            .inspect(|assinatura| {
-                // Numa chave RSA de 2048 bits a assinatura crua tem 256 bytes. Se vier
-                // muito maior, é sinal de que o PSC devolveu um envelope (CMS) em vez da
-                // assinatura pura — o Java rejeitaria com CKR_ARGUMENTS_BAD.
-                debug_log(&format!("  -> assinatura recebida: {} bytes", assinatura.len()));
-            })
+        self.state.sign(&SignParams {
+            certificate_alias: &self.certificate_alias,
+            id: &String::from_utf8_lossy(&self.id),
+            label: &self.label,
+            payload: &payload,
+            hash_algorithm: &hash_algorithm,
+            signature_format: &signature_format,
+        })
     }
 
     fn delete(&self) {}
@@ -545,35 +409,6 @@ fn prepare_hash(algorithm: &SignatureAlgorithm, data: &[u8]) -> (Vec<u8>, String
     }
 }
 
-/// Reconhece o OID do algoritmo de hash dentro de um DigestInfo DER (o formato que o
-/// SunPKCS11 manda no modo cru). Comparamos pelo prefixo DER completo, que é fixo e
-/// conhecido para cada algoritmo — mais simples e seguro do que escrever um parser ASN.1.
-fn split_digest_info(data: &[u8]) -> Option<(Vec<u8>, String)> {
-    let oid = digest_info_oid(data)?;
-    let prefixo = DIGEST_INFO_PREFIXOS.iter().find(|(p, _)| data.starts_with(p))?;
-    Some((data[prefixo.0.len()..].to_vec(), oid))
-}
-
-const DIGEST_INFO_PREFIXOS: &[(&[u8], &str)] = &[
-    // MD5 (34 bytes no total) — é o usado pelo PJe (MD5WITHRSA).
-    (&[0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10], "1.2.840.113549.2.5"),
-    // SHA-1 (35 bytes)
-    (&[0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A, 0x05, 0x00, 0x04, 0x14], "1.3.14.3.2.26"),
-    // SHA-256 (51 bytes)
-    (&[0x30, 0x31, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20], "2.16.840.1.101.3.4.2.1"),
-    // SHA-384 (67 bytes)
-    (&[0x30, 0x41, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30], "2.16.840.1.101.3.4.2.2"),
-    // SHA-512 (83 bytes)
-    (&[0x30, 0x51, 0x30, 0x0D, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40], "2.16.840.1.101.3.4.2.3"),
-];
-
-fn digest_info_oid(data: &[u8]) -> Option<String> {
-    DIGEST_INFO_PREFIXOS
-        .iter()
-        .find(|(prefixo, _)| data.starts_with(prefixo))
-        .map(|(_, oid)| oid.to_string())
-}
-
 fn digest_oid(digest: &native_pkcs11_traits::DigestType) -> String {
     match digest {
         native_pkcs11_traits::DigestType::Sha1 => "1.3.14.3.2.26",
@@ -585,15 +420,6 @@ fn digest_oid(digest: &native_pkcs11_traits::DigestType) -> String {
     .to_string()
 }
 
-#[derive(Debug, Deserialize)]
-struct BrokerLoginResponse {
-    access_token: String,
-}
-
-fn boxed(message: impl Into<String>) -> Box<dyn std::error::Error> {
-    Box::new(std::io::Error::other(message.into()))
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn C_GetFunctionList(
     ppFunctionList: CK_FUNCTION_LIST_PTR_PTR,
@@ -601,7 +427,7 @@ pub unsafe extern "C" fn C_GetFunctionList(
     if ppFunctionList.is_null() {
         return CKR_ARGUMENTS_BAD;
     }
-    let state = BACKEND_STATE.get_or_init(|| Arc::new(BackendState::new())).clone();
+    let state = BACKEND_STATE.get_or_init(|| Arc::new(Broker::from_env())).clone();
     BACKEND_REGISTERED.call_once(|| register_backend(Box::new(MyCertBackend { state })));
     let list = FUNCTION_LIST.get_or_init(|| {
         let mut list = unsafe { std::ptr::read(std::ptr::addr_of!(native_pkcs11::FUNC_LIST)) };
@@ -648,21 +474,6 @@ unsafe extern "C" fn mycert_C_Login(
 static ORIGINAL_GET_ATTRIBUTE_VALUE: OnceCell<
     Option<unsafe extern "C" fn(CK_SESSION_HANDLE, CK_OBJECT_HANDLE, CK_ATTRIBUTE_PTR, CK_ULONG) -> CK_RV>,
 > = OnceCell::new();
-
-/// Log de diagnóstico do C_GetAttributeValue: registra cada atributo pedido pelo Java e o
-/// que devolvemos. Serve pra descobrir QUAL atributo está causando CKR_ATTRIBUTE_TYPE_INVALID
-/// (o SunPKCS11 pede vários em sequência), em vez de supor. Ativa definindo a variável de
-/// ambiente MYCERT_PKCS11_LOG com o caminho do arquivo, ex.:
-///   setx MYCERT_PKCS11_LOG C:\\Users\\SEU_USUARIO\\mycert_pkcs11.log
-/// Sem essa variável, não escreve nada e não custa nada.
-fn debug_log(line: &str) {
-    if let Ok(path) = std::env::var("MYCERT_PKCS11_LOG") {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "{}", line);
-        }
-    }
-}
 
 /// Nome legível dos atributos que interessam ao diagnóstico; os demais saem em hexadecimal.
 fn attr_name(t: CK_ULONG) -> String {
@@ -815,43 +626,5 @@ unsafe extern "C" fn mycert_C_Logout(_hSession: CK_SESSION_HANDLE) -> CK_RV {
             Err(_) => CKR_GENERAL_ERROR,
         },
         None => CKR_OK,
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // DigestInfo real de MD5 (34 bytes) — o mesmo prefixo que o PJeOffice envia via
-    // MD5withRSA (ver DIAGNOSTICO-CALLBACK-SAFEID.md). Os últimos 16 bytes são só um
-    // hash de exemplo, não precisam corresponder a nada real pra este teste.
-    const MD5_DIGEST_INFO: [u8; 34] = [
-        0x30, 0x20, 0x30, 0x0C, 0x06, 0x08, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x02, 0x05, 0x05,
-        0x00, 0x04, 0x10, 0x88, 0x71, 0xD7, 0xB7, 0x6B, 0x54, 0xDC, 0x5D, 0x09, 0xFD, 0xD1, 0x71,
-        0x7D, 0x1C, 0x75, 0xF3,
-    ];
-
-    #[test]
-    fn reconhece_oid_do_md5_no_digest_info() {
-        assert_eq!(digest_info_oid(&MD5_DIGEST_INFO), Some("1.2.840.113549.2.5".to_string()));
-    }
-
-    #[test]
-    fn separa_o_hash_puro_do_cabecalho_md5() {
-        let (hash, oid) = split_digest_info(&MD5_DIGEST_INFO).expect("deveria reconhecer o MD5");
-        assert_eq!(oid, "1.2.840.113549.2.5");
-        // Só os 16 bytes do hash, sem o cabeçalho ASN.1 — é essa separação que corrige o
-        // "O OID do hash é inválido" que a API da SafeWeb devolvia quando mandávamos o
-        // DigestInfo inteiro como se fosse só o hash.
-        assert_eq!(hash.len(), 16);
-        assert_eq!(hash, &MD5_DIGEST_INFO[18..]);
-    }
-
-    #[test]
-    fn dados_sem_prefixo_conhecido_nao_reconhece_oid() {
-        let dados_aleatorios = [0xAA_u8; 32];
-        assert_eq!(digest_info_oid(&dados_aleatorios), None);
-        assert_eq!(split_digest_info(&dados_aleatorios), None);
     }
 }

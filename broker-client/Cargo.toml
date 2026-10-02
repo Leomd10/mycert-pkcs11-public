@@ -1,0 +1,18 @@
+[package]
+name = "mycert-broker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cliente do broker local do MyCert, compartilhado pelo módulo PKCS#11 e pelo KSP do Windows"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
+# Só para carimbar horário local nas linhas do MYCERT_PKCS11_LOG. A std do Rust não
+# expõe fuso local, e é o horário local que permite cruzar este log com o do PJeOffice
+# (que registra "06/09/2026 20:02:14 UTC-04:00"). `clock` é a única feature necessária;
+# o resto do chrono fica de fora.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -25,6 +25,13 @@ export interface MyCertConfig {
   username: string;
   lifetime: number;
   identifierCA: string;
+  // Momento (ISO) em que a última autorização CA foi iniciada. O callback-server guarda
+  // os registros indexados pelo `state` (que é o CPF) por 24h, então uma consulta feita
+  // logo após um novo push pode devolver o callback da autorização ANTERIOR, já
+  // revogada. Sem esta marca o app aceitava esse registro velho em silêncio, e o
+  // problema só aparecia bem depois, na hora de assinar, como "Esta solicitação não está
+  // ativa ou foi revogada". Ver `pollAuthorization`.
+  authorizationStartedAt: string;
   // Número de série do certificado usado na autorização (vem no callback como
   // serialNumber). Enviado como slot_alias no pwd_authorize para dizer ao PSC em qual
   // slot procurar a autorização — sem ele, o PSC "decide sozinho" e pode olhar o slot
@@ -56,6 +63,7 @@ const DEFAULT_CONFIG: MyCertConfig = {
   username: '',
   lifetime: 3600,
   identifierCA: '',
+  authorizationStartedAt: '',
   certificateSerialNumber: '',
   certificatePin: '',
   certificateAlias: '',

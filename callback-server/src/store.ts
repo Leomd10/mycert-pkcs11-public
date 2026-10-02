@@ -79,4 +79,12 @@ export class AuthorizationStore {
     this.purgeExpired();
     return this.records[state];
   }
+
+  /// Quantos registros o servidor conhece agora. Serve só para o log: um store vazio
+  /// logo após um 'callback GRAVADO' é a assinatura de disco efêmero (o processo
+  /// reiniciou e o arquivo se perdeu), enquanto um store com outros registros aponta
+  /// para `state` divergente entre quem gravou e quem consulta.
+  states(): string[] {
+    return Object.keys(this.records);
+  }
 }

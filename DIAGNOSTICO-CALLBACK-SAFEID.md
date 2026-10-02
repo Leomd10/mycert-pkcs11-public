@@ -1,9 +1,18 @@
-> **✅ RESOLVIDO.** Este documento registra a investigação original do
-> problema de callback. A causa raiz e a correção estão descritas nas
-> seções abaixo; o fluxo funciona desde então. Mantido como registro
-> histórico do processo de diagnóstico.
-
 # Diagnóstico — callback de autorização CA do SafeID/PSC não chega ao MyCert
+
+> **✅ RESOLVIDO.** Este documento registra a investigação original do
+> problema de callback (a autorização não chegava de volta ao MyCert). A
+> causa raiz e a correção completa estão nas seções abaixo; esse fluxo
+> funciona desde então — incluindo autorização, troca de token e assinatura
+> de documentos (validado de ponta a ponta no SERPRO). Mantido como registro
+> histórico do processo de diagnóstico.
+>
+> Uma limitação diferente e definitiva foi identificada depois desse
+> diagnóstico: o login por certificado no **PJeOffice Pro** especificamente
+> não funciona, porque esse assinador usa MD5withRSA e a **SafeWeb
+> confirmou oficialmente** (suporte, chamado #1266615) que a API só aceita
+> SHA-1 e SHA-256, sem alternativa para MD5. Ver a seção "Limitação
+> conhecida" do `README.md` na raiz do projeto.
 
 > Leia este arquivo antes de mexer em qualquer coisa. Ele resume tudo que já foi
 > investigado sobre o problema "aprova no SafeID do celular, mas a API não recebe
@@ -166,3 +175,25 @@ depende mais de código, são passos operacionais):
 Ainda não foi possível testar de ponta a ponta neste ambiente porque não há
 acesso à internet nem ao painel de cadastro de aplicação do SafeWeb — os
 passos 1–2 dependem do usuário/fornecedor.
+
+---
+
+## Atualização final — fechamento
+
+Todos os passos acima foram concluídos com sucesso: o `callback-server` foi
+hospedado, o `redirect_uri` foi cadastrado pela SafeWeb para um client_id
+próprio, e a autorização CA passou a funcionar de ponta a ponta.
+
+Na sequência, uma investigação separada (assinatura/login) revelou e
+corrigiu, nessa ordem: a troca do `identifierCA` pelo endpoint OAuth
+correto (`pwd_authorize`, não o backend da demonstração), a necessidade de
+concatenar a senha do titular ao `identifierCA`, o envio do `slot_alias`
+(número de série do certificado) para identificar corretamente a
+autorização, a separação do hash puro do DigestInfo enviado pelo Java, e a
+correção do `signature_format` de `CMS` para `RAW` (um módulo PKCS#11 deve
+devolver a assinatura crua, não um envelope completo).
+
+O resultado final: assinatura validada com sucesso no assinador do SERPRO.
+O único cenário que permanece bloqueado é o login via PJeOffice Pro, por
+uma limitação confirmada do lado da SafeWeb (não aceitam o OID de MD5) —
+ver `README.md`.

@@ -2,6 +2,7 @@
 node_modules/
 target/
 desktop/dist/
+callback-server/dist/
 callback-server/data/
 
 # Config local sensível (nunca deve ser versionada)

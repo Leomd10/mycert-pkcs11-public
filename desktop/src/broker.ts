@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { exchangeIdentifierCA, listCertificates, signHash } from './api-client';
+import { ApiError, exchangeIdentifierCA, listCertificates, signHash } from './api-client';
 import { SecureStore, type CertificateRecord, type MyCertConfig } from './secure-store';
 
 interface ActiveSession {
@@ -89,7 +89,28 @@ export class LocalBroker {
       json(response, 401, { message: 'Nenhuma autorização CA está disponível. Autorize o certificado no app.' });
       return;
     }
-    const token = await exchangeIdentifierCA(config, identifierCA);
+    // Mesmo motivo do try/catch em sign(): sem isto, um ApiError subia até o catch
+    // genérico de handle() e virava "HTTP 500" seco. O módulo PKCS#11 registrava só
+    // "broker login failed: status code 500", e a causa real — tipicamente
+    // "Esta solicitação não está ativa ou foi revogada", ou seja, a autorização CA
+    // expirou e precisa de um novo push — ficava visível apenas no console do Electron.
+    let token: Awaited<ReturnType<typeof exchangeIdentifierCA>>;
+    try {
+      token = await exchangeIdentifierCA(config, identifierCA);
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      console.error('Troca do identifierCA recusada pelo provedor:', {
+        status: error.status,
+        body: error.body,
+      });
+      json(response, 401, {
+        message: error.message,
+        upstream_status: error.status,
+        upstream_body: error.body,
+        hint: 'Refaça a autorização do certificado no app MyCert (push no celular) para obter um identifierCA novo.',
+      });
+      return;
+    }
     // Registra o que o SafeWeb devolveu de fato: se o escopo vier como
     // "single_signature", o token é invalidado logo após um único uso — o que se
     // manifesta como "Sessão PKCS#11 expirada" (HTTP 401) na hora de assinar.
@@ -153,11 +174,33 @@ export class LocalBroker {
       json(response, 400, { message: 'certificate_alias e hashes são obrigatórios' });
       return;
     }
-    const result = await signHash(session.config, token, {
-      certificate_alias: body.certificate_alias,
-      hashes: body.hashes,
-    });
-    json(response, 200, result);
+    // Sem este try/catch, um ApiError subia até o catch genérico de handle(), que o
+    // reescrevia como HTTP 500 { message } — apagando o status real e, principalmente,
+    // o CORPO devolvido pela SafeWeb. O módulo PKCS#11 registrava só
+    // "HTTP 500 corpo={"message":"API respondeu HTTP 400"}", que não identifica a causa
+    // da recusa. O corpo do provedor é a única evidência do motivo real: preserve-o.
+    try {
+      const result = await signHash(session.config, token, {
+        certificate_alias: body.certificate_alias,
+        hashes: body.hashes,
+      });
+      json(response, 200, result);
+    } catch (error) {
+      if (!(error instanceof ApiError)) throw error;
+      console.error('Assinatura recusada pelo provedor:', {
+        status: error.status,
+        body: error.body,
+        hash_algorithm: body.hashes.map((h) => h.hash_algorithm),
+        signature_format: body.hashes.map((h) => h.signature_format),
+      });
+      // 502: o erro é do provedor upstream, não do broker. `upstream_*` chega intacto
+      // ao log do MYCERT_PKCS11_LOG, que é onde o diagnóstico acontece de verdade.
+      json(response, 502, {
+        message: error.message,
+        upstream_status: error.status,
+        upstream_body: error.body,
+      });
+    }
   }
 
   private validSession(token: string): ActiveSession | undefined {

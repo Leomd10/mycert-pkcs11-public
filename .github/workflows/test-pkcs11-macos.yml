@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'pkcs11/**'
+      - 'broker-client/**'
       - '.github/workflows/test-pkcs11-macos.yml'
 
 jobs:
@@ -22,8 +23,10 @@ jobs:
 
       - name: Rodar os testes unitários (parsing do DigestInfo, etc.)
         run: |
-          cd pkcs11
-          cargo test --release
+          # Os testes do DigestInfo moraram em pkcs11/ até o cliente do broker ir para
+          # broker-client/. Rodar só pkcs11/ passaria com "running 0 tests".
+          (cd broker-client && cargo test --release)
+          (cd pkcs11 && cargo test --release)
 
       - name: Configurar Java
         uses: actions/setup-java@v4

@@ -1,0 +1,41 @@
+[package]
+name = "mycert-ksp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Key Storage Provider (CNG) do MyCert: expõe o certificado em nuvem no repositório do Windows"
+license = "Apache-2.0"
+
+[lib]
+name = "mycert_ksp"
+# cdylib = a DLL que o Windows carrega (System32\mycert_ksp.dll); rlib = para a
+# ferramenta de instalação reaproveitar os nomes e as rotinas de chave pública.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "mycert-ksp-tool"
+path = "src/bin/tool.rs"
+
+[dependencies]
+mycert-broker = { path = "../broker-client" }
+base64 = "0.22"
+sha1 = "0.10"
+# `oid` para o Pkcs1v15Sign::new::<Sha256>() da conferência no `testar`.
+sha2 = { version = "0.10", features = ["oid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Mesmo uso do módulo PKCS#11: ler modulus/expoente de dentro do certificado X.509.
+rsa = { version = "0.9", default-features = false, features = ["std", "pkcs5"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Sem `panic = "abort"` aqui, ao contrário do pkcs11: a DLL roda dentro do Edge, do
+# Chrome e de qualquer programa que assine pelo repositório do Windows. Com abort, um
+# panic derrubaria o navegador inteiro; com unwind, cada entrada da tabela o captura e
+# devolve NTE_FAIL.
