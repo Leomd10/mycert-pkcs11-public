@@ -130,15 +130,24 @@ para forçar quem for hospedar a escolher segredos próprios).
   demonstração pública do provedor, que motivou a arquitetura de callback
   próprio.
 
-## Limitação conhecida
+## Login do PJe por certificado (MD5withRSA)
 
-O login por certificado no **PJeOffice Pro** não funciona com certificados em
-nuvem. O desafio de autenticação é assinado com **MD5withRSA**, e provedores
-ICP-Brasil não assinam com o OID de MD5.
+O login por certificado no **PJeOffice Pro** assina o desafio com
+**MD5withRSA**, e a **API OAuth de integração** da SafeWeb, usada pelo MyCert,
+recusa o OID de MD5. Por isso o MyCert, sozinho, não conclui esse login.
 
-**A origem não é o PJeOffice nem o provedor do certificado: é a aplicação
-servidora do PJe.** Os três componentes foram verificados e cada um está
-correto no próprio escopo.
+**Existe solução oficial.** O SafeID Desktop 1.4.2 instala uma biblioteca
+PKCS#11 própria (`safeid-p11.dll` no Windows e `libsafeid-p11.dylib` no macOS),
+que o PJeOffice detecta sozinho. Validado em 02/10/2026 nos dois sistemas: o
+PJeOffice pede `MD5WITHRSA`, o SafeID Desktop recebe `hashAlgorithm: md5`, o
+serviço da SafeWeb responde 200 OK e o login no PJe conclui. Para esse login,
+use o SafeID Desktop 1.4.2 ou posterior.
+
+O MyCert continua indicado para o que essa biblioteca não cobre: assinatura
+por API com `client_id`, sem o app SafeID aberto.
+
+**A origem do MD5 não é o PJeOffice nem o provedor do certificado: é a
+aplicação servidora do PJe.** O que segue documenta como isso foi verificado.
 
 ### A cadeia, verificada
 
@@ -172,7 +181,7 @@ O OID do hash é inválido.
   at PSC.Business.SignatureBusiness.Sign(...) in ...\SignatureBusiness.cs:line 108
 ```
 
-### Por que o MyCert não tem o que corrigir
+### Por que o MyCert, pela API OAuth, não tem o que corrigir
 
 O PJeOffice usa um provider JCA próprio (`ANYwithRSASignature`), que calcula o
 digest em Java e faz o RSA cru via `Cipher`/`P11RSACipher`. Isso força
@@ -190,7 +199,7 @@ confirma que o caminho raw está correto, já que produziu uma requisição que 
 API aceitou. **Se o PJe passar a pedir SHA256withRSA, o login funciona sem
 nenhuma alteração neste projeto.**
 
-### Não há contorno pelo lado do cliente
+### Não há contorno pelo lado do cliente, só pela biblioteca oficial
 
 Trocar o algoritmo apenas na chamada do cliente não resolve: a aplicação
 servidora também precisa verificar a assinatura com o novo algoritmo. Nas
@@ -217,14 +226,18 @@ módulo PKCS#11. Quem assina é o próprio navegador, no handshake TLS, com
 SHA-256 — o PJeOffice não participa. No Edge e no Chrome, o mesmo login passa
 pelo KSP (ver "Repositório do Windows").
 
-O SafeID Desktop tem a mesma limitação no login do PJeOffice: o log dele
-(`%APPDATA%\SafeID Desktop\logs\main.log`) só registra pedidos SHA-256 vindos
-de navegadores, nunca MD5. O que o faz "funcionar pelo repositório do Windows"
-é o login pelo navegador, não uma assinatura MD5.
+**Login no PJe com MD5:** não pelo MyCert, e sim pela biblioteca oficial do
+SafeID Desktop 1.4.2 (ver o início desta seção). Duas observações de Windows
+que explicam por que o repositório do Windows nem sempre serve:
 
-Enquanto o fluxo de login não é adequado, o caminho de uso é entrar no PJe por
-senha/CPF ou gov.br e usar o certificado, via MyCert, para **assinar** dentro
-do processo — que é o cenário mais comum e funciona com SHA-256.
+- Com o SafeID Desktop 1.4.3 (provedor CNG), o login falha dentro do Java do
+  PJeOffice, antes de chegar à SafeWeb: o `SunMSCAPI` não pede MD5 a chaves
+  CNG (`java.security.SignatureException: Unrecognised hash algorithm`).
+- Com o SafeID Desktop 1.2.3 (CSP legado), o login funcionava pelo repositório
+  do Windows.
+
+Para o MyCert, o caminho de uso é entrar no PJe por senha/CPF ou gov.br e usar
+o certificado para **assinar** dentro do processo, que funciona com SHA-256.
 
 ## Segurança
 
